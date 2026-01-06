@@ -14,6 +14,7 @@ try:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.image as mpimg
+    import matplotlib.patches as patches
     import yaml
 except ImportError:
     print(
@@ -110,7 +111,12 @@ class EkahauProject:
 def get_ekahau_data(project):
     """Reads relevant Ekahau JSON files from the project."""
     data = {}
-    files_to_read = ['accessPoints.json', 'floorPlans.json', 'projectConfiguration.json', 'simulatedRadios.json', 'project.json']
+    files_to_read = [
+        'accessPoints.json', 'floorPlans.json', 'projectConfiguration.json',
+        'simulatedRadios.json', 'project.json', 'walls.json', 'wallTypes.json',
+        'wallSegments.json', 'wallPoints.json',
+        'attenuationAreaTypes.json', 'attenuationAreas.json'
+    ]
     
     for filename in files_to_read:
         key = filename.replace('.json', '')
@@ -221,7 +227,10 @@ def main():
             dest_image_path = None
 
             # Handle image copy and renaming
-            bitmap_id = fp.get('bitmapImageId')
+            if fp.get('bitmapImageId', None):
+                bitmap_id = fp.get('bitmapImageId', None)
+            elif fp.get('imageId', None):
+                bitmap_id = fp.get('imageId', None)
             if bitmap_id:
                 sanitized_name = sanitize_filename(fp_name)
                 dest_image_path = os.path.join(images_dir, f"{sanitized_name}.jpeg")
@@ -302,6 +311,195 @@ def main():
                 oi_fp.map_uri = f"file://images/{os.path.basename(dest_image_path)}"
 
             oi_floorplans.append(oi_fp)
+
+    # Process Walls, Wall Segments, and Wall Points
+    oi_wall_materials = []
+    wall_type_map = {}
+    
+    wall_types_source = ekahau_data.get('wallTypes') or ekahau_data.get('walls')
+    
+    if wall_types_source:
+        logger.info("Processing Wall Types...")
+        for wall_type in wall_types_source.get('wallTypes', []):
+            try:
+                # Extract attenuation from propagationProperties
+                attenuation = 0.0
+                props = wall_type.get('propagationProperties', [])
+                for prop in props:
+                    # Prefer 5GHz
+                    if prop.get('band') == 'FIVE':
+                        attenuation = prop.get('attenuationFactor', 0.0)
+                        break
+                
+                # Fallback if 0 or not found (though 0 is valid for air/cabling)
+                if attenuation == 0.0 and props:
+                     # Check if we have other bands with non-zero attenuation
+                     for prop in props:
+                         if prop.get('attenuationFactor', 0.0) > 0:
+                             attenuation = prop.get('attenuationFactor')
+                             break
+
+                material = ns.Material(
+                    name=wall_type.get('name'),
+                    thickness_m=wall_type.get('thickness', 0.0),
+                    display_color=wall_type.get('color'),
+                    rf_properties=ns.RfProperties(
+                        attenuation_per_m=attenuation
+                    ),
+                    bottom_height=wall_type.get('lowerEdge', 0.0),
+                    top_height=wall_type.get('upperEdge', 3.0)
+                )
+                oi_wall_materials.append(material)
+                wall_type_map[wall_type['id']] = material
+            except Exception as e:
+                logger.warning(f"Could not process wall type {wall_type.get('id')}: {e}")
+
+    wall_point_map = {}
+    if 'wallPoints' in ekahau_data:
+        logger.info("Processing Wall Points...")
+        for point in ekahau_data['wallPoints'].get('wallPoints', []):
+            wall_point_map[point['id']] = point.get('location')
+
+    floor_wall_segments_map = {} # floorId -> list of wall segments
+    if 'wallSegments' in ekahau_data and wall_point_map:
+        logger.info("Processing Wall Segments...")
+        for segment in ekahau_data['wallSegments'].get('wallSegments', []):
+            p1_id = segment.get('point1Id')
+            p2_id = segment.get('point2Id')
+            
+            loc1 = wall_point_map.get(p1_id)
+            loc2 = wall_point_map.get(p2_id)
+
+            if not loc1 or not loc2:
+                logger.warning(f"Skipping wall segment {segment.get('id')} due to missing points.")
+                continue
+
+            floor_id = loc1.get('floorPlanId')
+            if floor_id != loc2.get('floorPlanId'):
+                logger.warning(f"Wall segment {segment.get('id')} spans across different floors. Skipping.")
+                continue
+
+            floor_info = floor_id_map.get(floor_id)
+            if not floor_info:
+                logger.warning(f"Wall segment {segment.get('id')} on unknown floor {floor_id}. Skipping.")
+                continue
+            
+            # Get conversion factors
+            mpu = floor_info.get('metersPerUnit') or 0.0
+                
+            crop_min_x = floor_info.get('cropMinX', 0.0)
+            crop_min_y = floor_info.get('cropMinY', 0.0)
+            scale_x = floor_info.get('scale_x', 1.0)
+            scale_y = floor_info.get('scale_y', 1.0)
+            
+            # Get coordinates in pixels (Ekahau coords are in map units/pixels)
+            x1_px = (loc1.get('coord', {}).get('x', 0.0) - crop_min_x) * scale_x
+            y1_px = (loc1.get('coord', {}).get('y', 0.0) - crop_min_y) * scale_y
+            x2_px = (loc2.get('coord', {}).get('x', 0.0) - crop_min_x) * scale_x
+            y2_px = (loc2.get('coord', {}).get('y', 0.0) - crop_min_y) * scale_y
+            
+            wall_type_id = segment.get('wallTypeId')
+            material = wall_type_map.get(wall_type_id)
+            wall_type_name = material.name if material else "Unknown Wall"
+
+            oi_segment = ns.WallSegment(
+                wall_type=wall_type_name,
+                start_point=ns.WallPoint(x=x1_px, y=y1_px),
+                end_point=ns.WallPoint(x=x2_px, y=y2_px)
+            )
+            
+            if floor_id not in floor_wall_segments_map:
+                floor_wall_segments_map[floor_id] = []
+            floor_wall_segments_map[floor_id].append(oi_segment)
+
+    # Assign wall segments to floorplans
+    if floor_wall_segments_map:
+        for fp in oi_floorplans:
+            segments = floor_wall_segments_map.get(fp.vendor_id)
+            if segments:
+                fp.wall_segments = segments
+
+    # Process Attenuation Area Materials
+    oi_area_materials = []
+    attenuation_type_map = {}
+    
+    if 'attenuationAreaTypes' in ekahau_data:
+        logger.info("Processing Attenuation Area Types...")
+        for area_type in ekahau_data['attenuationAreaTypes'].get('attenuationAreaTypes', []):
+            try:
+                # Extract attenuation
+                attenuation = 0.0
+                props = area_type.get('propagationProperties', [])
+                for prop in props:
+                    if prop.get('band') == 'FIVE':
+                        attenuation = prop.get('attenuationFactor', 0.0)
+                        break
+                if attenuation == 0.0 and props:
+                     for prop in props:
+                         if prop.get('attenuationFactor', 0.0) > 0:
+                             attenuation = prop.get('attenuationFactor')
+                             break
+                
+                material = ns.Material(
+                    name=area_type.get('name'),
+                    display_color=area_type.get('color'),
+                    rf_properties=ns.RfProperties(
+                        attenuation_flat=attenuation
+                    ),
+                    bottom_height=area_type.get('lowerEdge', 0.0),
+                    top_height=area_type.get('upperEdge', 0.0)
+                )
+                oi_area_materials.append(material)
+                attenuation_type_map[area_type['id']] = material
+            except Exception as e:
+                logger.warning(f"Could not process attenuation area type {area_type.get('id')}: {e}")
+
+    # Process Attenuation Areas
+    floor_attenuation_areas_map = {}
+    if 'attenuationAreas' in ekahau_data:
+        logger.info("Processing Attenuation Areas...")
+        for area in ekahau_data['attenuationAreas'].get('attenuationAreas', []):
+            floor_id = area.get('floorPlanId')
+            floor_info = floor_id_map.get(floor_id)
+            if not floor_info:
+                continue
+            
+            crop_min_x = floor_info.get('cropMinX', 0.0)
+            crop_min_y = floor_info.get('cropMinY', 0.0)
+            scale_x = floor_info.get('scale_x', 1.0)
+            scale_y = floor_info.get('scale_y', 1.0)
+
+            points = area.get('area', [])
+            if len(points) < 3:
+                continue
+            
+            coords = []
+            for pt in points:
+                x = (pt.get('x', 0.0) - crop_min_x) * scale_x
+                y = (pt.get('y', 0.0) - crop_min_y) * scale_y
+                
+                coord = ns.Coordinate(
+                    coordinate_xyz=ns.CoordinateXyz(
+                        x=x, y=y, z=0.0, unit="pixels"
+                    )
+                )
+                coords.append(coord)
+            
+            type_id = area.get('typeId') or area.get('attenuationAreaTypeId')
+            material = attenuation_type_map.get(type_id)
+            
+            oi_area = ns.AttenuationArea(
+                area=ns.Area(coordinates=coords),
+                area_material=material if material else ns.Material(name="Unknown")
+            )
+            
+            if floor_id not in floor_attenuation_areas_map:
+                floor_attenuation_areas_map[floor_id] = []
+            floor_attenuation_areas_map[floor_id].append(oi_area)
+
+    if floor_attenuation_areas_map:
+        for fp in oi_floorplans:
+            fp.attenuation_areas = floor_attenuation_areas_map.get(fp.vendor_id)
 
     # Pre-process Radios
     ap_radios_map = {}
@@ -451,7 +649,9 @@ def main():
         oi_root = ns.OiWifi(
             openintent_version="2.0.0",
             accesspoints=oi_accesspoints,
-            floorplans=oi_floorplans
+            floorplans=oi_floorplans,
+            wall_materials=oi_wall_materials if oi_wall_materials else None,
+            area_materials=oi_area_materials if oi_area_materials else None
         )
     except Exception as e:
         logger.error(f"Validation failed during object creation: {e}")
@@ -465,8 +665,16 @@ def main():
     with open(output_file, 'w') as f:
         json.dump(json_data, f, indent=2)
     
-    # 7. Draw APs on Images
-    logger.info("Drawing AP locations on floor plan images...")
+    # 7. Draw APs and Walls on Images
+    logger.info("Drawing APs and walls on floor plan images...")
+
+    # Create a map of wall material names to their colors
+    wall_material_color_map = {}
+    if oi_root.wall_materials:
+        for material in oi_root.wall_materials:
+            if material.name and material.display_color:
+                wall_material_color_map[str(material.name)] = str(material.display_color)
+
     # Group AP coordinates by floorplan name using the OpenIntent object
     floor_ap_map = {} # floor_name -> list of (x, y)
     
@@ -506,11 +714,12 @@ def main():
                 img = mpimg.imread(image_path)
                 
                 ap_coords = floor_ap_map.get(str(fp.name), [])
-                if not ap_coords:
+                wall_segments = fp.wall_segments if fp.wall_segments else []
+                attenuation_areas = fp.attenuation_areas if fp.attenuation_areas else []
+                if not ap_coords and not wall_segments and not attenuation_areas:
                     continue
 
                 height, width = img.shape[:2]
-                logger.info(f"Adding {len(ap_coords)} APs to {os.path.basename(image_path)}")
 
                 # Create a figure and axes to match the image dimensions
                 # Calculate DPI to maintain consistent marker size relative to image dimensions
@@ -522,8 +731,36 @@ def main():
                 ax = fig.add_axes([0, 0, 1, 1])
                 ax.imshow(img)
                 
-                x_coords, y_coords = zip(*ap_coords)
-                ax.plot(x_coords, y_coords, 'go', markersize=5, markeredgecolor='black', markeredgewidth=0.5, zorder=10)
+                if attenuation_areas:
+                    logger.info(f"Adding {len(attenuation_areas)} attenuation areas to {os.path.basename(image_path)}")
+                    for area in attenuation_areas:
+                        pts = []
+                        if area.area and area.area.coordinates:
+                            for c in area.area.coordinates:
+                                if c.coordinate_xyz:
+                                    pts.append((c.coordinate_xyz.x, c.coordinate_xyz.y))
+                        
+                        if pts:
+                            color = '#808080'
+                            if area.area_material and area.area_material.display_color:
+                                color = str(area.area_material.display_color)
+                            
+                            poly = patches.Polygon(pts, closed=True, fill=True, facecolor=color, edgecolor=color, alpha=0.3, zorder=4)
+                            ax.add_patch(poly)
+
+                if wall_segments:
+                    logger.info(f"Adding {len(wall_segments)} wall segments to {os.path.basename(image_path)}")
+                    for segment in wall_segments:
+                        start = segment.start_point
+                        end = segment.end_point
+                        color = wall_material_color_map.get(str(segment.wall_type), '#808080')
+                        ax.plot([start.x, end.x], [start.y, end.y], color=color, linewidth=2, zorder=5)
+
+                if ap_coords:
+                    logger.info(f"Adding {len(ap_coords)} APs to {os.path.basename(image_path)}")
+                    x_coords, y_coords = zip(*ap_coords)
+                    ax.plot(x_coords, y_coords, 'go', markersize=5, markeredgecolor='black', markeredgewidth=0.5, zorder=10)
+
                 ax.axis('off')
                 
                 placement_image_path = os.path.join(placement_dir, os.path.basename(image_filename))
