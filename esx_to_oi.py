@@ -738,7 +738,7 @@ def main():
                         if area.area and area.area.coordinates:
                             for c in area.area.coordinates:
                                 if c.coordinate_xyz:
-                                    pts.append((c.coordinate_xyz.x, c.coordinate_xyz.y))
+                                    pts.append((c.coordinate_xyz.x, height - c.coordinate_xyz.y))
                         
                         if pts:
                             color = '#808080'
@@ -754,11 +754,12 @@ def main():
                         start = segment.start_point
                         end = segment.end_point
                         color = wall_material_color_map.get(str(segment.wall_type), '#808080')
-                        ax.plot([start.x, end.x], [start.y, end.y], color=color, linewidth=2, zorder=5)
+                        ax.plot([start.x, end.x], [height - start.y, height - end.y], color=color, linewidth=2, zorder=5)
 
                 if ap_coords:
                     logger.info(f"Adding {len(ap_coords)} APs to {os.path.basename(image_path)}")
                     x_coords, y_coords = zip(*ap_coords)
+                    y_coords = [height - y for y in y_coords]
                     ax.plot(x_coords, y_coords, 'go', markersize=5, markeredgecolor='black', markeredgewidth=0.5, zorder=10)
 
                 ax.axis('off')
